@@ -1,21 +1,116 @@
-version: 2.1
-
-orbs:
-  python: circleci/python@0.2.1
-
+version: 2
 jobs:
-  build-and-test:
-    executor: python/default
+  lint:
+    docker:
+      - image: circleci/python:3.6
+    environment:
+      PIPENV_VENV_IN_PROJECT: 1
     steps:
       - checkout
-      - python/load-cache
-      - python/install-deps
-      - python/save-cache
+      - restore_cache:
+          keys:
+            - v3-pipenv-{{ checksum "Pipfile.lock" }}
+            - v3-pipenv-
+      - run: pipenv sync --dev
+      - run: pipenv run make vendor
+      - run: pipenv run make lint
+
+  # Snapshots the dependencies. Snyk will send notifications if any new
+  # vulnerabilities appear for this snapshot. This should only be run on
+  # `master`, since it represents the state of shipped dependencies.
+  snyk-monitor:
+    docker:
+      - image: circleci/python:3.6-node
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v3-pipenv-{{ checksum "Pipfile.lock" }}
+            - v3-pipenv-
+      - run: pipenv sync --dev
       - run:
-          command: ./manage.py test
-          name: Test
+          name: install snyk
+          command: sudo npm install -g snyk
+      - run: snyk monitor
+
+  snyk-test:
+    docker:
+      - image: circleci/python:3.6-node
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v3-pipenv-{{ checksum "Pipfile.lock" }}
+            - v3-pipenv-
+      - run: pipenv sync --dev
+      - run:
+          name: install snyk
+          command: sudo npm install -g snyk
+      - run: snyk test
+
+  test:
+    docker:
+      - image: circleci/python:3.6
+    parallelism: 5
+    environment:
+      PIPENV_VENV_IN_PROJECT: 1
+    steps:
+      - checkout
+      - setup_remote_docker
+      # Restore cache and install python dependencies
+      - restore_cache:
+          keys:
+            - v3-pipenv-{{ checksum "Pipfile.lock" }}
+            - v3-pipenv-
+      - run:
+          name: install python dependencies
+          command: |
+            pipenv clean
+            pipenv sync --dev
+      - run:
+          name: Setup ansible-galaxy
+          command: pipenv run make vendor
+      - save_cache:
+          key: v3-pipenv-{{ checksum "Pipfile.lock" }}
+          paths:
+            - .venv
+            - ansible/roles/vendor
+      - run:
+          name: Run tests
+          command: |
+            TEST_TARGETS=$(make circleci-glob | circleci tests split)
+            pipenv run make ${TEST_TARGETS}
+  deploy-ci:
+    docker:
+      - image: circleci/python:3.6
+    environment:
+      JENKINS_URL: https://ci.ci.datagov.us
+    steps:
+      - checkout
+      - deploy:
+          name: Trigger Jenkins deploy
+          command: bin/jenkins_build deploy-ci-platform
+
 
 workflows:
-  main:
+  version: 2
+  commit:
     jobs:
-      - build-and-test
+      - lint
+      - snyk-test
+      - test
+      - snyk-monitor:
+          filters:
+            branches:
+              only:
+                - master
+
+      # TODO re-enable once secrets are updated and IR gives us the go ahead
+      #- deploy-ci:
+      #    requires:
+      #      - lint
+      #      - test
+      #      - snyk-test
+      #    filters:
+      #      branches:
+      #        only: develop
